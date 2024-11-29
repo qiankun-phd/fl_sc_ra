@@ -3,7 +3,6 @@ from gym import spaces
 import numpy as np
 import math
 from scipy.io import loadmat
-from collections import defaultdict
 
 
 class BaseStations:
@@ -95,12 +94,142 @@ class CustomWirelessEnv(gym.Env):
             self.para_S[i] = np.column_stack((beta_s, phi_s, lamda_s, si_s))
 
     def generate_channel_fading(self):
-        # 信道衰落生成代码，与原始实现相同
-        pass
+        h_large = {}  # 大规模衰落
+        h_small = {}  # 小规模衰落
+
+        for n_cell in range(self.n_cell):
+            n_users = self.cell_num[n_cell]  # 当前基站的用户总数
+            h_large[n_cell] = np.zeros((n_users, self.n_cell))  # 大规模衰落，从 n_cell 用户到所有基站
+
+            # 计算大规模衰落
+            for n_cell_1 in range(self.n_cell):
+                d = np.sqrt((self.user_positions[n_cell][:, 0] - self.bs_positions[n_cell_1][0]) ** 2 +
+                            (self.user_positions[n_cell][:, 1] - self.bs_positions[n_cell_1][1]) ** 2)  # 距离
+                pl = 128.1 + 37.6 * np.log10(d / 1000)  # 路径损耗
+                h_large[n_cell][:, n_cell_1] = 10 ** (-(pl + self.shadow_factor) / 10)  # 大规模衰落系数
+
+            # 计算小规模衰落和综合信道系数
+            for n_channel in range(self.channels):
+                h_small[(n_cell, n_channel)] = np.zeros((self.n_cell, self.nr, n_users), dtype=complex)  # 小规模衰落
+                self.h[(n_cell, n_channel)] = np.zeros((self.n_cell, self.nr, n_users), dtype=complex)  # 综合信道系数
+
+                for n_d in range(n_users):  # 遍历 n_cell 的每个用户
+                    h_real = np.random.randn(self.n_cell, self.nr) / np.sqrt(2)
+                    h_imag = np.random.randn(self.n_cell, self.nr) / np.sqrt(2)
+                    h_small[(n_cell, n_channel)][:, :, n_d] = h_real + 1j * h_imag  # 小规模衰落
+
+                    for n_cell_1 in range(self.n_cell):  # 遍历所有基站
+                        self.h[(n_cell, n_channel)][n_cell_1, :, n_d] = (
+                                h_small[(n_cell, n_channel)][n_cell_1, :, n_d] *
+                                np.sqrt(h_large[n_cell][n_d, n_cell_1])
+                        )  # 综合信道系数
 
     def calculate_qoe_real_for_train(self, actions_all):
-        # QoE计算逻辑，保留原始实现
-        pass
+        channel_result = actions_all[:, 0]
+        power_result = actions_all[:, 1]
+        k_result = actions_all[:, 2]
+
+        H_S = self.H_S
+        G_th = 0.5
+        w_phi = self.w_phi
+        para_S = self.para_S
+        bandwidth = self.bandwidth
+        N_cell = self.n_cell
+        h = self.h
+        P_noise = 180000 * 10 ** (-17.4)
+
+        sem_table = self.sem_table
+
+        QoE_real = [None] * N_cell
+        snr_range_S = np.arange(-10, 21, 1)  # SNR 范围
+
+        k_range_S = np.arange(1, 21, 1)
+        P_range_db = np.array([-10, -5, 0, 5, 10, 15, 20])
+        P_range = 10 ** (P_range_db / 10)
+
+        # 检查信道冲突
+        total_channels = self.channels * self.n_cell
+        conflicted_channels = 0
+
+        cell_channels = defaultdict(list)
+        cell_power = defaultdict(list)
+        cell_seman = defaultdict(list)
+        for i in range(self.n_usr):
+            cell_index = self.cell_index[i]
+            channel = channel_result[i]
+            power = P_range[power_result[i]]
+            k_s = k_range_S[k_result[i]]
+            cell_channels[cell_index].append(channel)
+            cell_power[cell_index].append(power)
+            cell_seman[cell_index].append(k_s)
+
+        for n_cell in range(N_cell):
+
+            user_channels = cell_channels[n_cell + 1]
+            user_channels = [ch for ch in user_channels if ch != 0]
+
+            channel_counts = {}
+            for ch in user_channels:
+                channel_counts[ch] = channel_counts.get(ch, 0) + 1
+
+            # 检测信道冲突
+            for ch, count in channel_counts.items():
+                if count > 1:
+                    conflicted_channels += 1
+
+        # 如果有信道冲突，返回冲突比例
+        if conflicted_channels > 0:
+            conflict_ratio = (conflicted_channels - total_channels) / total_channels
+            return conflict_ratio
+
+        # 如果没有信道冲突，计算 QoE
+        for n_cell in range(N_cell):
+            users = self.cell_num[n_cell]
+            sinr_db = np.zeros(users)
+
+            for n_d in range(users):
+                if channel_result[n_cell][n_d] != 0:
+                    I = 0
+                    channel_i = channel_result[n_cell][n_d]
+                    H = h[(n_cell, channel_i)][n_cell, :, n_d].T
+
+                    # 计算干扰
+                    for nn_cell in range(N_cell):
+                        if nn_cell != n_cell:
+                            interference_indices = np.where(channel_result[nn_cell] == channel_i)[0]
+                            if interference_indices.size > 0:
+                                in_d_i = interference_indices[0]
+                                H_i = h[(nn_cell, channel_i)][n_cell, :, in_d_i].T
+                                I += power[nn_cell][in_d_i] * (abs(H.conj().T @ H_i)) ** 2
+
+                    # 计算 SINR
+                    SINR = (power[n_cell][n_d] * (abs(H.conj().T @ H)) ** 2) / (
+                            np.linalg.norm(H, 2) ** 2 * P_noise + I)
+                    sinr_db[n_d] = round(10 * np.log10(SINR))
+            self.sinr_db.append(sinr_db)
+
+            # 单模用户 QoE 计算
+            QoE_real[n_cell] = np.zeros(users)
+            for n_s in range(users):
+                if k_result[n_cell][n_s] != 0:
+                    if sinr_db[n_s] < min(snr_range_S):
+                        QoE_real[n_cell][n_s] = 0
+                    else:
+                        sinr_db[n_s] = min(max(sinr_db[n_s], min(snr_range_S)), max(snr_range_S))
+                        sinr_index = int(sinr_db[n_s] - min(snr_range_S))
+                        k_s = min(max(k_result[n_cell][n_s], min(k_range_S)), max(k_range_S))
+                        k_index_s = int(k_s - min(snr_range_S))
+                        si = sem_table[k_index_s, sinr_index]
+                        phi = H_S / (k_result[n_cell][n_s] / bandwidth)
+                        G_phi = 1 / (1 + math.exp(para_S[n_cell][n_s, 0] * (para_S[n_cell][n_s, 1] - phi / 1000)))
+                        G_si = 1 / (1 + math.exp(para_S[n_cell][n_s, 2] * (para_S[n_cell][n_s, 3] - si)))
+                        QoE = w_phi[n_cell][n_s] * G_phi + (1 - w_phi[n_cell][n_s]) * G_si
+                        if G_si < G_th or G_phi < G_th:
+                            QoE_real[n_cell][n_s] = 0
+                        else:
+                            QoE_real[n_cell][n_s] = QoE
+            self.simi.append(sinr_db)
+        return sum(QoE_real)
 
     def reset(self):
         self.generate_user_parameters()
