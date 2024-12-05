@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras import layers, Model,
+from tensorflow.keras import layers, Model
 
 class ActorCriticNetwork(Model):
 

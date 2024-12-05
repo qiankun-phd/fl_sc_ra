@@ -1,14 +1,36 @@
 import torch
-from marl_network import CTDEActorCriticNetwork
+from marl_network import SharedActorCriticNetwork
 from ppo import ppo_policy_data, ppo_policy_error
 from gae import gae
+from Env_SC import CustomWirelessEnv
+from ReplayBuffer import ReplayBuffer
+from typing import List
 
 
-# delimiter
-def mappo_training_opeator() -> None:
-    batch_size, agent_num, local_state_shape, agent_specific_global_state_shape = 4, 18, 5, 108
-    action_shape = [7, 7, 21]
-    # 熵加成权重，有利于探索。
+def sample_action(logit: List[torch.Tensor]) -> torch.Tensor:
+    """
+    **功能**:
+        根据多个 logit 分布依次采样动作，并返回所有动作的张量。
+
+    **输入**:
+        - `logit`: 一个包含多个 `torch.Tensor` 的列表，每个张量表示某一动作维度的 logits。
+                   每个张量的形状为 `(batch_size, agent_num, action_dim)`。
+
+    **输出**:
+        - 返回形状为 `(batch_size, agent_num, len(logit))` 的张量，表示所有维度的采样动作。
+    """
+    actions = []  # 存储每个维度采样的动作
+    for logits in logit:
+        prob = torch.softmax(logits, dim=-1)  # 计算概率
+        dist = torch.distributions.Categorical(probs=prob)  # 创建分布
+        actions.append(dist.sample())  # 对当前维度进行采样
+
+    # 合并所有维度的动作到最后一维
+    return torch.stack(actions, dim=-1)
+
+
+def update(model, buffer, done) -> None:
+
     entropy_weight = 0.001
     # 价值损失权重，旨在平衡不同损失函数量级。
     value_weight = 0.5
@@ -18,7 +40,6 @@ def mappo_training_opeator() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # 定义多智能体神经网络和优化器。
-    model = CTDEActorCriticNetwork(agent_num, local_state_shape, agent_specific_global_state_shape, action_shape)
     model.to(device)
     # Adam 是深度强化学习中最常用的优化器。 如果你想添加权重衰减机制，应该使用 ``torch.optim.AdamW`` 。
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -27,28 +48,11 @@ def mappo_training_opeator() -> None:
     # 注意，数据应该与网络保持相同的计算设备 (device)。
     # 为简单起见，这里我们将整个批次数据视为一个完整的 episode。
     # 在实际应用中，训练批次是多个 episode 的组合。我们通常使用 ``done`` 变量来划分不同的 episode 。
-    local_state = torch.randn(batch_size, agent_num, local_state_shape).to(device)
-    agent_specific_global_state = torch.randn(batch_size, agent_num, agent_specific_global_state_shape).to(device)
-    logit_old = [
-        torch.randn(batch_size, agent_num, action_dim).to(device)
-        for action_dim in action_shape
-    ]
-    value_old = torch.randn(batch_size, agent_num).to(device)
-    done = torch.zeros(batch_size).to(device)
-    done[-1] = 1
-    action = torch.stack([
-        torch.randint(0, dim, (batch_size, agent_num)).to(device)
-        for dim in action_shape
-    ], dim=-1)
-    reward = torch.randn(batch_size, agent_num).to(device)
-    # 目标回报可以用不同的方法计算。这里我们使用奖励的折扣累计值。
-    # 还可以使用广义优势估计 (GAE) 法、n-step TD 方法等等。
-    return_ = torch.zeros_like(reward)
-    for i in reversed(range(batch_size)):
-        return_[i] = reward[i] + (discount_factor * return_[i + 1] if i + 1 < batch_size else 0)
+
+    state, action, reward, next_states, logit_old, value_old, return_ = buffer.get()
 
     # Actor-Critic 网络前向传播。
-    output = model(local_state, agent_specific_global_state)
+    output = model(state)
     # ``squeeze`` 操作将 shape 从 $$(B, A, 1)$$ 转化为 $$(B, A)$$.
     value = output['value'].squeeze(-1)
     # 使用广义优势估计（Generalized Advantage Estimation，简称GAE）方法来计算优势（Advantage）。
@@ -82,5 +86,29 @@ def mappo_training_opeator() -> None:
     print('mappo_training_opeator is ok')
 
 
+
+def train() -> None:
+    batch_size, agent_num, obs_shape, n_cell, n_usr, n_channel, buffer_size = 4, 18, 108, 3, 18, 6, 200
+    action_shape = [7, 7, 21]
+    model = SharedActorCriticNetwork(agent_num, obs_shape, action_shape)
+    env = CustomWirelessEnv(n_cell, n_usr, n_channel)
+    state = env.reset()
+
+    episode_reward, done = 0, False
+
+
+    buffer = ReplayBuffer(buffer_size, obs_shape, action_shape)
+
+    for ep in range(3000):
+        for b in range(batch_size):
+            output = model(state)
+            action = sample_action(output['logit'])
+            next_state, reward, done, info = env.step(action)
+            buffer.store(state, action, reward, next_state, output['logit'], output['value'])
+            state = next_state
+            episode_reward += reward
+        buffer.compute_returns_and_advantages(last_value=0)
+        update(model, buffer, done)
+
 if __name__ == "__main__":
-    mappo_training_opeator()
+    train()

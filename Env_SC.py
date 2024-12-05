@@ -1,9 +1,8 @@
 import gym
-from gym import spaces
 import numpy as np
 import math
 from scipy.io import loadmat
-from xxxxxxx import xxxx
+import torch
 
 
 
@@ -60,9 +59,8 @@ class CustomWirelessEnv(gym.Env):
         self.sem_table = loadmat('./DeepSC_table.mat')
 
         # 定义 action 和 observation space
-        self.action_space = spaces.Box(low=0, high=1, shape=(n_usr, 3), dtype=np.float32)
-        state_dim = (n_cell * 4) + n_usr * 2
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32)
+        self.action_space = 3
+        self.state_dim = 108
 
     def _generate_user_distribution(self):
         for n in range(self.n_cell):
@@ -233,12 +231,27 @@ class CustomWirelessEnv(gym.Env):
             self.simi.append(sinr_db)
         return sum(QoE_real)
 
-    def reset(self):
+    def reset(self) -> torch.Tensor:
+        """
+        Resets the environment and initializes all state-related variables.
+
+        Returns:
+            torch.Tensor: The initial state of the environment as a single concatenated tensor.
+        """
+        # Generate user parameters and initialize variables
         self.generate_user_parameters()
-        state_para_S = np.concatenate([self.para_S[i].flatten() for i in range(self.n_cell)])
-        self.sinr_db = np.zeros(self.n_usr, dtype='int')
-        self.simi = np.zeros(self.n_usr, dtype='float32')
-        state = np.concatenate([state_para_S, self.sinr_db, self.simi])
+
+        # Flatten and stack parameters using PyTorch
+        state_para_S = torch.cat(
+            [torch.tensor(self.para_S[i].flatten(), dtype=torch.float32) for i in range(self.n_cell)])
+
+        # Initialize SINR and similarity tensors
+        self.sinr_db = torch.zeros(self.n_usr, dtype=torch.float32)
+        self.simi = torch.zeros(self.n_usr, dtype=torch.float32)
+
+        # Concatenate all components into a single state tensor
+        state = torch.cat([state_para_S, self.sinr_db, self.simi])
+
         return state
 
     def step(self, action):
